@@ -15,6 +15,9 @@
 
 package io.confluent.connect.json;
 
+import static io.confluent.connect.json.JsonSchemaDataConfig.SCHEMAS_CACHE_SIZE_CONFIG;
+import static io.confluent.connect.json.JsonSchemaDataConfig.SCHEMAS_CACHE_SIZE_DEFAULT;
+
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -29,13 +32,28 @@ import com.fasterxml.jackson.databind.node.TextNode;
 import com.google.common.annotations.VisibleForTesting;
 import io.confluent.connect.schema.ConnectEnum;
 import io.confluent.connect.schema.ConnectUnion;
+import io.confluent.kafka.schemaregistry.json.JsonSchema;
 import io.confluent.kafka.schemaregistry.json.jackson.Jackson;
 import io.confluent.kafka.schemaregistry.utils.BoundedConcurrentHashMap;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Date;
 import org.apache.kafka.connect.data.Decimal;
@@ -57,28 +75,8 @@ import org.everit.json.schema.NumberSchema;
 import org.everit.json.schema.ObjectSchema;
 import org.everit.json.schema.ReferenceSchema;
 import org.everit.json.schema.StringSchema;
-
-import java.io.IOException;
-import java.math.BigDecimal;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.EnumMap;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.SortedMap;
-import java.util.TreeMap;
-import java.util.stream.Collectors;
-
-import io.confluent.kafka.schemaregistry.json.JsonSchema;
 import org.json.JSONArray;
 import org.json.JSONObject;
-
-import static io.confluent.connect.json.JsonSchemaDataConfig.SCHEMAS_CACHE_SIZE_CONFIG;
-import static io.confluent.connect.json.JsonSchemaDataConfig.SCHEMAS_CACHE_SIZE_DEFAULT;
 
 public class JsonSchemaData {
 
@@ -114,14 +112,21 @@ public class JsonSchemaData {
 
   public static final String NULL_MARKER = "<NULL>";
 
-  private static final JsonNodeFactory JSON_NODE_FACTORY =
-      JsonNodeFactory.withExactBigDecimals(true);
+  private static final JsonNodeFactory JSON_NODE_FACTORY = JsonNodeFactory.withExactBigDecimals(
+      true);
 
   private static final ObjectMapper OBJECT_MAPPER = Jackson.newObjectMapper();
 
   private static final Map<Schema.Type, JsonToConnectTypeConverter> TO_CONNECT_CONVERTERS =
-      new EnumMap<>(
-      Schema.Type.class);
+      new EnumMap<>(Schema.Type.class);
+  // Convert values in Kafka Connect form into their logical types. These logical converters are
+  // discovered by logical type
+  // names specified in the field
+  private static final HashMap<String, JsonToConnectLogicalTypeConverter>
+      TO_CONNECT_LOGICAL_CONVERTERS = new HashMap<>();
+  private static final HashMap<String, ConnectToJsonLogicalTypeConverter>
+      TO_JSON_LOGICAL_CONVERTERS = new HashMap<>();
+  private static final Object NONE_MARKER = new Object();
 
   static {
     TO_CONNECT_CONVERTERS.put(Schema.Type.BOOLEAN, (data, schema, value) -> value.booleanValue());
@@ -171,21 +176,19 @@ public class JsonSchemaData {
         if (!value.isArray()) {
           throw new DataException(
               "Maps with non-string fields should be encoded as JSON array of objects, but "
-                  + "found "
-                  + value.getNodeType());
+                  + "found " + value.getNodeType());
         }
         for (JsonNode entry : value) {
           if (!entry.isObject()) {
-            throw new DataException("Found invalid map entry instead of object: "
-                + entry.getNodeType());
+            throw new DataException(
+                "Found invalid map entry instead of object: " + entry.getNodeType());
           }
           if (entry.size() != 2) {
-            throw new DataException("Found invalid map entry, expected length 2 but found :" + entry
-                .size());
+            throw new DataException(
+                "Found invalid map entry, expected length 2 but found :" + entry.size());
           }
           result.put(data.toConnectData(keySchema, entry.get(KEY_FIELD)),
-              data.toConnectData(valueSchema, entry.get(VALUE_FIELD))
-          );
+              data.toConnectData(valueSchema, entry.get(VALUE_FIELD)));
         }
       }
       return result;
@@ -193,8 +196,7 @@ public class JsonSchemaData {
     TO_CONNECT_CONVERTERS.put(Schema.Type.STRUCT, (data, schema, value) -> {
       if (isUnionSchema(schema)) {
         boolean generalizedSumTypeSupport = ConnectUnion.isUnion(schema);
-        String fieldNamePrefix = generalizedSumTypeSupport
-            ? GENERALIZED_TYPE_UNION_FIELD_PREFIX
+        String fieldNamePrefix = generalizedSumTypeSupport ? GENERALIZED_TYPE_UNION_FIELD_PREFIX
             : JSON_TYPE_ONE_OF + ".field.";
         int numMatchingProperties = 0;
         Field matchingField = null;
@@ -203,8 +205,7 @@ public class JsonSchemaData {
 
           if (isInstanceOfSchemaTypeForSimpleSchema(fieldSchema, value)) {
             return new Struct(schema.schema()).put(fieldNamePrefix + field.index(),
-                data.toConnectData(fieldSchema, value)
-            );
+                data.toConnectData(fieldSchema, value));
           } else {
             int matching = matchStructSchema(fieldSchema, value);
             if (matching > numMatchingProperties) {
@@ -214,16 +215,14 @@ public class JsonSchemaData {
           }
         }
         if (matchingField != null) {
-          return new Struct(schema.schema()).put(
-              fieldNamePrefix + matchingField.index(),
-              data.toConnectData(matchingField.schema(), value)
-          );
+          return new Struct(schema.schema()).put(fieldNamePrefix + matchingField.index(),
+              data.toConnectData(matchingField.schema(), value));
         }
         throw new DataException("Did not find matching oneof field for data");
       } else {
         if (!value.isObject()) {
-          throw new DataException("Structs should be encoded as JSON objects, but found "
-              + value.getNodeType());
+          throw new DataException(
+              "Structs should be encoded as JSON objects, but found " + value.getNodeType());
         }
 
         Struct result = new Struct(schema.schema());
@@ -237,6 +236,110 @@ public class JsonSchemaData {
         return result;
       }
     });
+  }
+
+  static {
+    TO_CONNECT_LOGICAL_CONVERTERS.put(Decimal.LOGICAL_NAME, (schema, value) -> {
+      if (value.isNumber()) {
+        return value.decimalValue();
+      }
+      if (value.isBinary() || value.isTextual()) {
+        try {
+          return Decimal.toLogical(schema, value.binaryValue());
+        } catch (Exception e) {
+          throw new DataException("Invalid bytes for Decimal field", e);
+        }
+      }
+
+      throw new DataException("Invalid type for Decimal, "
+          + "underlying representation should be numeric or bytes but was " + value.getNodeType());
+    });
+
+    TO_CONNECT_LOGICAL_CONVERTERS.put(Date.LOGICAL_NAME, (schema, value) -> {
+      if (!(value.isInt())) {
+        throw new DataException(
+            "Invalid type for Date, " + "underlying representation should be integer but was "
+                + value.getNodeType());
+      }
+      return Date.toLogical(schema, value.intValue());
+    });
+
+    TO_CONNECT_LOGICAL_CONVERTERS.put(Time.LOGICAL_NAME, (schema, value) -> {
+      if (!(value.isInt())) {
+        throw new DataException(
+            "Invalid type for Time, " + "underlying representation should be integer but was "
+                + value.getNodeType());
+      }
+      return Time.toLogical(schema, value.intValue());
+    });
+
+    TO_CONNECT_LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, (schema, value) -> {
+      if (!(value.isIntegralNumber())) {
+        throw new DataException(
+            "Invalid type for Timestamp, " + "underlying representation should be integral but was "
+                + value.getNodeType());
+      }
+      return Timestamp.toLogical(schema, value.longValue());
+    });
+  }
+
+  static {
+    TO_JSON_LOGICAL_CONVERTERS.put(Decimal.LOGICAL_NAME, (schema, value, config) -> {
+      if (!(value instanceof BigDecimal)) {
+        throw new DataException(
+            "Invalid type for Decimal, " + "expected BigDecimal but was " + value.getClass());
+      }
+
+      final BigDecimal decimal = (BigDecimal) value;
+      switch (config.decimalFormat()) {
+        case NUMERIC:
+          return JSON_NODE_FACTORY.numberNode(decimal);
+        case BASE64:
+          return JSON_NODE_FACTORY.binaryNode(Decimal.fromLogical(schema, decimal));
+        default:
+          throw new DataException("Unexpected " + JsonConverterConfig.DECIMAL_FORMAT_CONFIG + ": "
+              + config.decimalFormat());
+      }
+    });
+
+    TO_JSON_LOGICAL_CONVERTERS.put(Date.LOGICAL_NAME, (schema, value, config) -> {
+      if (!(value instanceof java.util.Date)) {
+        throw new DataException("Invalid type for Date, expected Date but was " + value.getClass());
+      }
+      return JSON_NODE_FACTORY.numberNode(Date.fromLogical(schema, (java.util.Date) value));
+    });
+
+    TO_JSON_LOGICAL_CONVERTERS.put(Time.LOGICAL_NAME, (schema, value, config) -> {
+      if (!(value instanceof java.util.Date)) {
+        throw new DataException("Invalid type for Time, expected Date but was " + value.getClass());
+      }
+      return JSON_NODE_FACTORY.numberNode(Time.fromLogical(schema, (java.util.Date) value));
+    });
+
+    TO_JSON_LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, (schema, value, config) -> {
+      if (!(value instanceof java.util.Date)) {
+        throw new DataException(
+            "Invalid type for Timestamp, " + "expected Date but was " + value.getClass());
+      }
+      return JSON_NODE_FACTORY.numberNode(Timestamp.fromLogical(schema, (java.util.Date) value));
+    });
+  }
+
+  private final JsonSchemaDataConfig config;
+  private final Map<Schema, JsonSchema> fromConnectSchemaCache;
+  private final Map<JsonSchema, Schema> toConnectSchemaCache;
+  private final boolean generalizedSumTypeSupport;
+
+  public JsonSchemaData() {
+    this(new JsonSchemaDataConfig.Builder().with(SCHEMAS_CACHE_SIZE_CONFIG,
+        SCHEMAS_CACHE_SIZE_DEFAULT).build());
+  }
+
+  public JsonSchemaData(JsonSchemaDataConfig jsonSchemaDataConfig) {
+    this.config = jsonSchemaDataConfig;
+    fromConnectSchemaCache = new BoundedConcurrentHashMap<>(jsonSchemaDataConfig.schemaCacheSize());
+    toConnectSchemaCache = new BoundedConcurrentHashMap<>(jsonSchemaDataConfig.schemaCacheSize());
+    generalizedSumTypeSupport = jsonSchemaDataConfig.isGeneralizedSumTypeSupport();
   }
 
   private static boolean isInstanceOfSchemaTypeForSimpleSchema(Schema fieldSchema, JsonNode value) {
@@ -270,9 +373,7 @@ public class JsonSchemaData {
     if (fieldSchema.type() != Schema.Type.STRUCT || !value.isObject()) {
       return 0;
     }
-    Set<String> schemaFields = fieldSchema.fields()
-        .stream()
-        .map(Field::name)
+    Set<String> schemaFields = fieldSchema.fields().stream().map(Field::name)
         .collect(Collectors.toSet());
     Set<String> objectFields = new HashSet<>();
     for (Iterator<Entry<String, JsonNode>> iter = value.fields(); iter.hasNext(); ) {
@@ -282,7 +383,7 @@ public class JsonSchemaData {
     intersectSet.retainAll(objectFields);
 
     int childrenMatchFactor = 0;
-    for (String intersectedElement: intersectSet) {
+    for (String intersectedElement : intersectSet) {
       Schema childSchema = fieldSchema.field(intersectedElement).schema();
       JsonNode childValue = value.get(intersectedElement);
       childrenMatchFactor += matchStructSchema(childSchema, childValue);
@@ -291,126 +392,80 @@ public class JsonSchemaData {
     return intersectSet.size() + childrenMatchFactor;
   }
 
-  // Convert values in Kafka Connect form into their logical types. These logical converters are
-  // discovered by logical type
-  // names specified in the field
-  private static final HashMap<String, JsonToConnectLogicalTypeConverter>
-      TO_CONNECT_LOGICAL_CONVERTERS = new HashMap<>();
-
-  static {
-    TO_CONNECT_LOGICAL_CONVERTERS.put(Decimal.LOGICAL_NAME, (schema, value) -> {
-      if (value.isNumber()) {
-        return value.decimalValue();
+  private static Object toJsonSchemaValue(Object value) {
+    try {
+      Object primitiveValue = NONE_MARKER;
+      if (value instanceof BinaryNode) {
+        primitiveValue = ((BinaryNode) value).asText();
+      } else if (value instanceof BooleanNode) {
+        primitiveValue = ((BooleanNode) value).asBoolean();
+      } else if (value instanceof NullNode) {
+        primitiveValue = null;
+      } else if (value instanceof NumericNode) {
+        primitiveValue = ((NumericNode) value).numberValue();
+      } else if (value instanceof TextNode) {
+        primitiveValue = ((TextNode) value).asText();
       }
-      if (value.isBinary() || value.isTextual()) {
-        try {
-          return Decimal.toLogical(schema, value.binaryValue());
-        } catch (Exception e) {
-          throw new DataException("Invalid bytes for Decimal field", e);
+      if (primitiveValue != NONE_MARKER) {
+        return primitiveValue;
+      } else {
+        Object jsonObject;
+        if (value instanceof ArrayNode) {
+          jsonObject = OBJECT_MAPPER.treeToValue(((ArrayNode) value), JSONArray.class);
+        } else if (value instanceof JsonNode) {
+          jsonObject = OBJECT_MAPPER.treeToValue(((JsonNode) value), JSONObject.class);
+        } else if (value.getClass().isArray()) {
+          jsonObject = OBJECT_MAPPER.convertValue(value, JSONArray.class);
+        } else {
+          jsonObject = OBJECT_MAPPER.convertValue(value, JSONObject.class);
         }
+        return jsonObject;
       }
-
-      throw new DataException("Invalid type for Decimal, "
-          + "underlying representation should be numeric or bytes but was " + value.getNodeType());
-    });
-
-    TO_CONNECT_LOGICAL_CONVERTERS.put(Date.LOGICAL_NAME, (schema, value) -> {
-      if (!(value.isInt())) {
-        throw new DataException(
-            "Invalid type for Date, "
-            + "underlying representation should be integer but was " + value.getNodeType());
-      }
-      return Date.toLogical(schema, value.intValue());
-    });
-
-    TO_CONNECT_LOGICAL_CONVERTERS.put(Time.LOGICAL_NAME, (schema, value) -> {
-      if (!(value.isInt())) {
-        throw new DataException(
-            "Invalid type for Time, "
-            + "underlying representation should be integer but was " + value.getNodeType());
-      }
-      return Time.toLogical(schema, value.intValue());
-    });
-
-    TO_CONNECT_LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, (schema, value) -> {
-      if (!(value.isIntegralNumber())) {
-        throw new DataException(
-            "Invalid type for Timestamp, "
-            + "underlying representation should be integral but was " + value.getNodeType());
-      }
-      return Timestamp.toLogical(schema, value.longValue());
-    });
+    } catch (JsonProcessingException e) {
+      throw new DataException("Invalid default value", e);
+    }
   }
 
-  private static final HashMap<String, ConnectToJsonLogicalTypeConverter>
-      TO_JSON_LOGICAL_CONVERTERS = new HashMap<>();
-
-  static {
-    TO_JSON_LOGICAL_CONVERTERS.put(Decimal.LOGICAL_NAME, (schema, value, config) -> {
-      if (!(value instanceof BigDecimal)) {
-        throw new DataException("Invalid type for Decimal, "
-            + "expected BigDecimal but was " + value.getClass());
-      }
-
-      final BigDecimal decimal = (BigDecimal) value;
-      switch (config.decimalFormat()) {
-        case NUMERIC:
-          return JSON_NODE_FACTORY.numberNode(decimal);
-        case BASE64:
-          return JSON_NODE_FACTORY.binaryNode(Decimal.fromLogical(schema, decimal));
-        default:
-          throw new DataException("Unexpected "
-              + JsonConverterConfig.DECIMAL_FORMAT_CONFIG + ": " + config.decimalFormat());
-      }
-    });
-
-    TO_JSON_LOGICAL_CONVERTERS.put(Date.LOGICAL_NAME, (schema, value, config) -> {
-      if (!(value instanceof java.util.Date)) {
-        throw new DataException("Invalid type for Date, expected Date but was " + value.getClass());
-      }
-      return JSON_NODE_FACTORY.numberNode(Date.fromLogical(schema, (java.util.Date) value));
-    });
-
-    TO_JSON_LOGICAL_CONVERTERS.put(Time.LOGICAL_NAME, (schema, value, config) -> {
-      if (!(value instanceof java.util.Date)) {
-        throw new DataException("Invalid type for Time, expected Date but was " + value.getClass());
-      }
-      return JSON_NODE_FACTORY.numberNode(Time.fromLogical(schema, (java.util.Date) value));
-    });
-
-    TO_JSON_LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, (schema, value, config) -> {
-      if (!(value instanceof java.util.Date)) {
-        throw new DataException("Invalid type for Timestamp, "
-            + "expected Date but was " + value.getClass());
-      }
-      return JSON_NODE_FACTORY.numberNode(
-          Timestamp.fromLogical(schema, (java.util.Date) value));
-    });
+  private static Schema nonOptional(Schema schema) {
+    return new ConnectSchema(schema.type(), false, schema.defaultValue(), schema.name(),
+        schema.version(), schema.doc(), schema.parameters(), fields(schema), keySchema(schema),
+        valueSchema(schema));
   }
 
-  private final JsonSchemaDataConfig config;
-  private final Map<Schema, JsonSchema> fromConnectSchemaCache;
-  private final Map<JsonSchema, Schema> toConnectSchemaCache;
-  private final boolean generalizedSumTypeSupport;
-
-  public JsonSchemaData() {
-    this(new JsonSchemaDataConfig.Builder().with(
-        SCHEMAS_CACHE_SIZE_CONFIG,
-        SCHEMAS_CACHE_SIZE_DEFAULT
-    ).build());
+  private static List<Field> fields(Schema schema) {
+    Schema.Type type = schema.type();
+    if (Schema.Type.STRUCT.equals(type)) {
+      return schema.fields();
+    } else {
+      return null;
+    }
   }
 
-  public JsonSchemaData(JsonSchemaDataConfig jsonSchemaDataConfig) {
-    this.config = jsonSchemaDataConfig;
-    fromConnectSchemaCache = new BoundedConcurrentHashMap<>(jsonSchemaDataConfig.schemaCacheSize());
-    toConnectSchemaCache = new BoundedConcurrentHashMap<>(jsonSchemaDataConfig.schemaCacheSize());
-    generalizedSumTypeSupport = jsonSchemaDataConfig.isGeneralizedSumTypeSupport();
+  private static Schema keySchema(Schema schema) {
+    Schema.Type type = schema.type();
+    if (Schema.Type.MAP.equals(type)) {
+      return schema.keySchema();
+    } else {
+      return null;
+    }
+  }
+
+  private static Schema valueSchema(Schema schema) {
+    Schema.Type type = schema.type();
+    if (Schema.Type.MAP.equals(type) || Schema.Type.ARRAY.equals(type)) {
+      return schema.valueSchema();
+    } else {
+      return null;
+    }
+  }
+
+  private static boolean isUnionSchema(Schema schema) {
+    return JSON_TYPE_ONE_OF.equals(schema.name()) || ConnectUnion.isUnion(schema);
   }
 
   /**
-   * Convert this object, in the org.apache.kafka.connect.data format, into a JSON object,
-   * returning both the schema
-   * and the converted object.
+   * Convert this object, in the org.apache.kafka.connect.data format, into a JSON object, returning
+   * both the schema and the converted object.
    */
   public JsonNode fromConnectData(Schema schema, Object logicalValue) {
     if (logicalValue == null) {
@@ -429,8 +484,8 @@ public class JsonSchemaData {
 
     Object value = logicalValue;
     if (schema != null && schema.name() != null) {
-      ConnectToJsonLogicalTypeConverter logicalConverter =
-          TO_JSON_LOGICAL_CONVERTERS.get(schema.name());
+      ConnectToJsonLogicalTypeConverter logicalConverter = TO_JSON_LOGICAL_CONVERTERS.get(
+          schema.name());
       if (logicalConverter != null) {
         return logicalConverter.convert(schema, logicalValue, config);
       }
@@ -441,9 +496,8 @@ public class JsonSchemaData {
       if (schema == null) {
         schemaType = ConnectSchema.schemaType(value.getClass());
         if (schemaType == null) {
-          throw new DataException("Java class "
-              + value.getClass()
-              + " does not have corresponding schema type.");
+          throw new DataException(
+              "Java class " + value.getClass() + " does not have corresponding schema type.");
         }
       } else {
         schemaType = schema.type();
@@ -501,8 +555,8 @@ public class JsonSchemaData {
               }
             }
           } else {
-            objectMode = schema.keySchema().type() == Schema.Type.STRING && !schema.keySchema()
-                .isOptional();
+            objectMode =
+                schema.keySchema().type() == Schema.Type.STRING && !schema.keySchema().isOptional();
           }
           ObjectNode obj = null;
           ArrayNode list = null;
@@ -537,8 +591,9 @@ public class JsonSchemaData {
           // one of the union types.
           if (isUnionSchema(schema)) {
             for (Field field : schema.fields()) {
-              Object object = config.ignoreDefaultForNullables()
-                  ? struct.getWithoutDefault(field.name()) : struct.get(field);
+              Object object =
+                  config.ignoreDefaultForNullables() ? struct.getWithoutDefault(field.name())
+                      : struct.get(field);
               if (object != null) {
                 return fromConnectData(field.schema(), object);
               }
@@ -547,8 +602,9 @@ public class JsonSchemaData {
           } else {
             ObjectNode obj = JSON_NODE_FACTORY.objectNode();
             for (Field field : schema.fields()) {
-              Object fieldValue = config.ignoreDefaultForNullables()
-                  ? struct.getWithoutDefault(field.name()) : struct.get(field);
+              Object fieldValue =
+                  config.ignoreDefaultForNullables() ? struct.getWithoutDefault(field.name())
+                      : struct.get(field);
               JsonNode jsonNode = fromConnectData(field.schema(), fieldValue);
               if (jsonNode != null) {
                 obj.set(field.name(), jsonNode);
@@ -624,8 +680,8 @@ public class JsonSchemaData {
     }
 
     if (schema != null && schema.name() != null) {
-      JsonToConnectLogicalTypeConverter logicalConverter =
-          TO_CONNECT_LOGICAL_CONVERTERS.get(schema.name());
+      JsonToConnectLogicalTypeConverter logicalConverter = TO_CONNECT_LOGICAL_CONVERTERS.get(
+          schema.name());
       if (logicalConverter != null) {
         return logicalConverter.convert(schema, jsonValue);
       }
@@ -647,19 +703,18 @@ public class JsonSchemaData {
     return resultSchema;
   }
 
-  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(
-      FromConnectContext ctx, Schema schema) {
+  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(FromConnectContext ctx,
+      Schema schema) {
     return rawSchemaFromConnectSchema(ctx, schema, null);
   }
 
-  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(
-      FromConnectContext ctx, Schema schema, Integer index) {
+  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(FromConnectContext ctx,
+      Schema schema, Integer index) {
     return rawSchemaFromConnectSchema(ctx, schema, index, false);
   }
 
-  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(
-      FromConnectContext ctx, Schema schema, Integer index, boolean ignoreOptional
-  ) {
+  private org.everit.json.schema.Schema rawSchemaFromConnectSchema(FromConnectContext ctx,
+      Schema schema, Integer index, boolean ignoreOptional) {
     if (schema == null) {
       return null;
     }
@@ -701,9 +756,8 @@ public class JsonSchemaData {
         builder = BooleanSchema.builder();
         break;
       case STRING:
-        if (schema.parameters() != null
-            && (schema.parameters().containsKey(GENERALIZED_TYPE_ENUM)
-                || schema.parameters().containsKey(JSON_TYPE_ENUM))) {
+        if (schema.parameters() != null && (schema.parameters().containsKey(GENERALIZED_TYPE_ENUM)
+            || schema.parameters().containsKey(JSON_TYPE_ENUM))) {
           EnumSchema.Builder enumBuilder = EnumSchema.builder();
           String paramName = generalizedSumTypeSupport ? GENERALIZED_TYPE_ENUM : JSON_TYPE_ENUM;
           for (Map.Entry<String, String> entry : schema.parameters().entrySet()) {
@@ -721,16 +775,15 @@ public class JsonSchemaData {
         }
         break;
       case BYTES:
-        builder = Decimal.LOGICAL_NAME.equals(schema.name())
-                  ? NumberSchema.builder()
-                  : StringSchema.builder();
+        builder = Decimal.LOGICAL_NAME.equals(schema.name()) ? NumberSchema.builder()
+            : StringSchema.builder();
         unprocessedProps.put(CONNECT_TYPE_PROP, CONNECT_TYPE_BYTES);
         break;
       case ARRAY:
         Schema arrayValueSchema = schema.valueSchema();
         String refId = null;
-        if (arrayValueSchema.parameters() != null
-            && arrayValueSchema.parameters().containsKey(JSON_ID_PROP)) {
+        if (arrayValueSchema.parameters() != null && arrayValueSchema.parameters()
+            .containsKey(JSON_ID_PROP)) {
           refId = arrayValueSchema.parameters().get(JSON_ID_PROP);
         }
         org.everit.json.schema.Schema itemsSchema;
@@ -744,16 +797,16 @@ public class JsonSchemaData {
       case MAP:
         // JSON Schema only supports string keys
         if (schema.keySchema().type() == Schema.Type.STRING && !schema.keySchema().isOptional()) {
-          org.everit.json.schema.Schema valueSchema =
-              rawSchemaFromConnectSchema(ctx, schema.valueSchema());
+          org.everit.json.schema.Schema valueSchema = rawSchemaFromConnectSchema(ctx,
+              schema.valueSchema());
           builder = ObjectSchema.builder().schemaOfAdditionalProperties(valueSchema);
           unprocessedProps.put(CONNECT_TYPE_PROP, CONNECT_TYPE_MAP);
         } else {
           ObjectSchema.Builder entryBuilder = ObjectSchema.builder();
-          org.everit.json.schema.Schema keySchema =
-              rawSchemaFromConnectSchema(ctx, schema.keySchema(), 0);
-          org.everit.json.schema.Schema valueSchema =
-              rawSchemaFromConnectSchema(ctx, schema.valueSchema(), 1);
+          org.everit.json.schema.Schema keySchema = rawSchemaFromConnectSchema(ctx,
+              schema.keySchema(), 0);
+          org.everit.json.schema.Schema valueSchema = rawSchemaFromConnectSchema(ctx,
+              schema.valueSchema(), 1);
           entryBuilder.addPropertySchema(KEY_FIELD, keySchema);
           entryBuilder.addPropertySchema(VALUE_FIELD, valueSchema);
           builder = ArraySchema.builder().allItemSchema(entryBuilder.build());
@@ -768,10 +821,8 @@ public class JsonSchemaData {
             combinedBuilder.subschema(NullSchema.INSTANCE);
           }
           for (Field field : schema.fields()) {
-            combinedBuilder.subschema(rawSchemaFromConnectSchema(ctx, nonOptional(field.schema()),
-                field.index(),
-                true
-            ));
+            combinedBuilder.subschema(
+                rawSchemaFromConnectSchema(ctx, nonOptional(field.schema()), field.index(), true));
           }
           builder = combinedBuilder;
         } else if (schema.isOptional()) {
@@ -785,8 +836,8 @@ public class JsonSchemaData {
           for (Field field : schema.fields()) {
             Schema fieldSchema = field.schema();
             String fieldRefId = null;
-            if (fieldSchema.parameters() != null
-                && fieldSchema.parameters().containsKey(JSON_ID_PROP)) {
+            if (fieldSchema.parameters() != null && fieldSchema.parameters()
+                .containsKey(JSON_ID_PROP)) {
               fieldRefId = fieldSchema.parameters().get(JSON_ID_PROP);
             }
             org.everit.json.schema.Schema jsonSchema;
@@ -818,9 +869,7 @@ public class JsonSchemaData {
         builder.description(schema.doc());
       }
       if (schema.parameters() != null) {
-        Map<String, String> parameters = schema.parameters()
-            .entrySet()
-            .stream()
+        Map<String, String> parameters = schema.parameters().entrySet().stream()
             .filter(e -> !e.getKey().startsWith(NAMESPACE))
             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
         if (parameters.size() > 0) {
@@ -838,9 +887,8 @@ public class JsonSchemaData {
           combinedBuilder.subschema(NullSchema.INSTANCE);
           combinedBuilder.subschema(builder.unprocessedProperties(unprocessedProps).build());
           if (index != null) {
-            combinedBuilder.unprocessedProperties(Collections.singletonMap(CONNECT_INDEX_PROP,
-                index
-            ));
+            combinedBuilder.unprocessedProperties(
+                Collections.singletonMap(CONNECT_INDEX_PROP, index));
           }
           builder = combinedBuilder;
           unprocessedProps = new HashMap<>();
@@ -854,84 +902,6 @@ public class JsonSchemaData {
       unprocessedProps.put(CONNECT_INDEX_PROP, index);
     }
     return builder.unprocessedProperties(unprocessedProps).build();
-  }
-
-  private static final Object NONE_MARKER = new Object();
-
-  private static Object toJsonSchemaValue(Object value) {
-    try {
-      Object primitiveValue = NONE_MARKER;
-      if (value instanceof BinaryNode) {
-        primitiveValue = ((BinaryNode) value).asText();
-      } else if (value instanceof BooleanNode) {
-        primitiveValue = ((BooleanNode) value).asBoolean();
-      } else if (value instanceof NullNode) {
-        primitiveValue = null;
-      } else if (value instanceof NumericNode) {
-        primitiveValue = ((NumericNode) value).numberValue();
-      } else if (value instanceof TextNode) {
-        primitiveValue = ((TextNode) value).asText();
-      }
-      if (primitiveValue != NONE_MARKER) {
-        return primitiveValue;
-      } else {
-        Object jsonObject;
-        if (value instanceof ArrayNode) {
-          jsonObject = OBJECT_MAPPER.treeToValue(((ArrayNode) value), JSONArray.class);
-        } else if (value instanceof JsonNode) {
-          jsonObject = OBJECT_MAPPER.treeToValue(((JsonNode) value), JSONObject.class);
-        } else if (value.getClass().isArray()) {
-          jsonObject = OBJECT_MAPPER.convertValue(value, JSONArray.class);
-        } else {
-          jsonObject = OBJECT_MAPPER.convertValue(value, JSONObject.class);
-        }
-        return jsonObject;
-      }
-    } catch (JsonProcessingException e) {
-      throw new DataException("Invalid default value", e);
-    }
-  }
-
-
-  private static Schema nonOptional(Schema schema) {
-    return new ConnectSchema(schema.type(),
-        false,
-        schema.defaultValue(),
-        schema.name(),
-        schema.version(),
-        schema.doc(),
-        schema.parameters(),
-        fields(schema),
-        keySchema(schema),
-        valueSchema(schema)
-    );
-  }
-
-  private static List<Field> fields(Schema schema) {
-    Schema.Type type = schema.type();
-    if (Schema.Type.STRUCT.equals(type)) {
-      return schema.fields();
-    } else {
-      return null;
-    }
-  }
-
-  private static Schema keySchema(Schema schema) {
-    Schema.Type type = schema.type();
-    if (Schema.Type.MAP.equals(type)) {
-      return schema.keySchema();
-    } else {
-      return null;
-    }
-  }
-
-  private static Schema valueSchema(Schema schema) {
-    Schema.Type type = schema.type();
-    if (Schema.Type.MAP.equals(type) || Schema.Type.ARRAY.equals(type)) {
-      return schema.valueSchema();
-    } else {
-      return null;
-    }
   }
 
   public Schema toConnectSchema(JsonSchema schema) {
@@ -961,15 +931,13 @@ public class JsonSchemaData {
     return toConnectSchema(ctx, jsonSchema, null);
   }
 
-  private Schema toConnectSchema(
-      ToConnectContext ctx, org.everit.json.schema.Schema jsonSchema, Integer version) {
+  private Schema toConnectSchema(ToConnectContext ctx, org.everit.json.schema.Schema jsonSchema,
+      Integer version) {
     return toConnectSchema(ctx, jsonSchema, version, false);
   }
 
-  private Schema toConnectSchema(
-      ToConnectContext ctx, org.everit.json.schema.Schema jsonSchema,
-      Integer version, boolean forceOptional
-  ) {
+  private Schema toConnectSchema(ToConnectContext ctx, org.everit.json.schema.Schema jsonSchema,
+      Integer version, boolean forceOptional) {
     if (jsonSchema == null) {
       return null;
     }
@@ -1065,9 +1033,9 @@ public class JsonSchemaData {
         if (subSchema instanceof NullSchema) {
           builder.optional();
         } else {
-          String subFieldName = generalizedSumTypeSupport
-              ? GENERALIZED_TYPE_UNION_FIELD_PREFIX + index
-              : name + ".field." + index;
+          String subFieldName =
+              generalizedSumTypeSupport ? GENERALIZED_TYPE_UNION_FIELD_PREFIX + index
+                  : name + ".field." + index;
           builder.field(subFieldName, toConnectSchema(ctx, subSchema, null, true));
           index++;
         }
@@ -1081,10 +1049,9 @@ public class JsonSchemaData {
       String type = (String) arraySchema.getUnprocessedProperties().get(CONNECT_TYPE_PROP);
       if (CONNECT_TYPE_MAP.equals(type) && itemsSchema instanceof ObjectSchema) {
         ObjectSchema objectSchema = (ObjectSchema) itemsSchema;
-        builder = SchemaBuilder.map(toConnectSchema(ctx, objectSchema.getPropertySchemas()
-                .get(KEY_FIELD)),
-            toConnectSchema(ctx, objectSchema.getPropertySchemas().get(VALUE_FIELD))
-        );
+        builder = SchemaBuilder.map(
+            toConnectSchema(ctx, objectSchema.getPropertySchemas().get(KEY_FIELD)),
+            toConnectSchema(ctx, objectSchema.getPropertySchemas().get(VALUE_FIELD)));
       } else {
         builder = SchemaBuilder.array(toConnectSchema(ctx, itemsSchema));
       }
@@ -1093,8 +1060,7 @@ public class JsonSchemaData {
       String type = (String) objectSchema.getUnprocessedProperties().get(CONNECT_TYPE_PROP);
       if (CONNECT_TYPE_MAP.equals(type)) {
         builder = SchemaBuilder.map(Schema.STRING_SCHEMA,
-            toConnectSchema(ctx, objectSchema.getSchemaOfAdditionalProperties())
-        );
+            toConnectSchema(ctx, objectSchema.getSchemaOfAdditionalProperties()));
       } else {
         builder = SchemaBuilder.struct();
         ctx.put(objectSchema, builder);
@@ -1112,8 +1078,9 @@ public class JsonSchemaData {
         for (Map.Entry<String, org.everit.json.schema.Schema> property : sortedMap.values()) {
           String subFieldName = property.getKey();
           org.everit.json.schema.Schema subSchema = property.getValue();
-          boolean isFieldOptional = config.useOptionalForNonRequiredProperties()
-              && !objectSchema.getRequiredProperties().contains(subFieldName);
+          boolean isFieldOptional =
+              config.useOptionalForNonRequiredProperties() && !objectSchema.getRequiredProperties()
+                  .contains(subFieldName);
           builder.field(subFieldName, toConnectSchema(ctx, subSchema, null, isFieldOptional));
         }
       }
@@ -1153,8 +1120,7 @@ public class JsonSchemaData {
     }
     if (jsonSchema.hasDefaultValue()) {
       Object defaultVal = jsonSchema.getDefaultValue();
-      JsonNode jsonNode = defaultVal == JSONObject.NULL
-          ? NullNode.getInstance()
+      JsonNode jsonNode = defaultVal == JSONObject.NULL ? NullNode.getInstance()
           : OBJECT_MAPPER.convertValue(defaultVal, JsonNode.class);
       builder.defaultValue(toConnectData(builder, jsonNode));
     }
@@ -1167,8 +1133,7 @@ public class JsonSchemaData {
     return result;
   }
 
-  private Schema allOfToConnectSchema(
-      ToConnectContext ctx, CombinedSchema combinedSchema,
+  private Schema allOfToConnectSchema(ToConnectContext ctx, CombinedSchema combinedSchema,
       Integer version, boolean forceOptional) {
     ConstSchema constSchema = null;
     EnumSchema enumSchema = null;
@@ -1200,8 +1165,8 @@ public class JsonSchemaData {
       for (Map.Entry<String, org.everit.json.schema.Schema> property : properties.entrySet()) {
         String subFieldName = property.getKey();
         org.everit.json.schema.Schema subSchema = property.getValue();
-        boolean isFieldOptional = config.useOptionalForNonRequiredProperties()
-            && !required.get(subFieldName);
+        boolean isFieldOptional =
+            config.useOptionalForNonRequiredProperties() && !required.get(subFieldName);
         builder.field(subFieldName, toConnectSchema(ctx, subSchema, null, isFieldOptional));
       }
       if (forceOptional) {
@@ -1242,14 +1207,12 @@ public class JsonSchemaData {
         return toConnectSchema(ctx, referenceSchema.getReferredSchema(), version, forceOptional);
       }
     }
-    throw new IllegalArgumentException("Unsupported criterion "
-        + combinedSchema.getCriterion() + " for " + combinedSchema);
+    throw new IllegalArgumentException(
+        "Unsupported criterion " + combinedSchema.getCriterion() + " for " + combinedSchema);
   }
 
-  private void collectPropertySchemas(
-      org.everit.json.schema.Schema schema,
-      Map<String, org.everit.json.schema.Schema> properties,
-      Map<String, Boolean> required,
+  private void collectPropertySchemas(org.everit.json.schema.Schema schema,
+      Map<String, org.everit.json.schema.Schema> properties, Map<String, Boolean> required,
       Set<JsonSchema> visited) {
     JsonSchema jsonSchema = new JsonSchema(schema);
     if (visited.contains(jsonSchema)) {
@@ -1266,8 +1229,9 @@ public class JsonSchemaData {
       }
     } else if (schema instanceof ObjectSchema) {
       ObjectSchema objectSchema = (ObjectSchema) schema;
-      for (Map.Entry<String, org.everit.json.schema.Schema> entry
-          : objectSchema.getPropertySchemas().entrySet()) {
+      for (Map.Entry<String, org.everit.json.schema.Schema> entry :
+          objectSchema.getPropertySchemas()
+          .entrySet()) {
         String fieldName = entry.getKey();
         properties.put(fieldName, entry.getValue());
         required.put(fieldName, objectSchema.getRequiredProperties().contains(fieldName));
@@ -1278,33 +1242,32 @@ public class JsonSchemaData {
     }
   }
 
-  private static boolean isUnionSchema(Schema schema) {
-    return JSON_TYPE_ONE_OF.equals(schema.name()) || ConnectUnion.isUnion(schema);
-  }
-
   private interface JsonToConnectTypeConverter {
+
     Object convert(JsonSchemaData data, Schema schema, JsonNode value);
   }
 
   private interface ConnectToJsonLogicalTypeConverter {
+
     JsonNode convert(Schema schema, Object value, JsonSchemaDataConfig config);
   }
 
   private interface JsonToConnectLogicalTypeConverter {
+
     Object convert(Schema schema, JsonNode value);
   }
 
   /**
-   * Wraps a SchemaBuilder.
-   * The internal builder should never be returned, so that the schema is not built prematurely.
+   * Wraps a SchemaBuilder. The internal builder should never be returned, so that the schema is not
+   * built prematurely.
    */
   static class SchemaWrapper extends SchemaBuilder {
 
     private final SchemaBuilder builder;
-    // Optional that overrides the one in builder
-    private boolean optional;
     // Parameters that override the ones in builder
     private final Map<String, String> parameters;
+    // Optional that overrides the one in builder
+    private boolean optional;
 
     public SchemaWrapper(SchemaBuilder builder, boolean optional) {
       super(Type.STRUCT);
@@ -1444,6 +1407,7 @@ public class JsonSchemaData {
    * Class that holds the context for performing {@code toConnectSchema}
    */
   private static class ToConnectContext {
+
     private final Map<org.everit.json.schema.Schema, SchemaBuilder> schemaToStructMap;
     private int idIndex = 0;
     private int unionIndex = 0;
@@ -1473,6 +1437,7 @@ public class JsonSchemaData {
    * Class that holds the context for performing {@code fromConnectSchema}
    */
   private static class FromConnectContext {
+
     private final Set<String> ids;
 
     public FromConnectContext() {
